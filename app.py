@@ -1,282 +1,138 @@
 import streamlit as st
-import requests
-import json
-import base64
+import cv2
+import numpy as np
+from PIL import Image
 import io
 import zipfile
 import os
 
-# --- 設定頁面配置 (必須在第一行) ---
+# --- 頁面設定 ---
 st.set_page_config(
-    page_title="AI 圖片去浮水印 PRO",
-    page_icon="✨",
+    page_title="AI 圖片去浮水印工具",
+    page_icon="🎨",
     layout="centered",
     initial_sidebar_state="collapsed"
 )
 
-# --- CSS 樣式注入 (深色質感介面) ---
+# --- CSS 美化 ---
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
-
-    .stApp {
-        background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-        font-family: 'Inter', sans-serif;
-        color: white;
-    }
-
-    h1 { font-weight: 900 !important; text-align: center; padding-bottom: 1rem; }
-    h1 span { color: #f43f5e; }
-
-    .stFileUploader {
-        background: rgba(255,255,255,0.05);
-        backdrop-filter: blur(10px);
-        border: 1px dashed rgba(255,255,255,0.1);
-        border-radius: 1.5rem;
-        padding: 2rem;
-        transition: all 0.3s ease;
-    }
-    .stFileUploader:hover { border-color: #f43f5e; transform: scale(1.01); }
-
-    /* 按鈕樣式 */
-    .stButton > button {
-        background-color: #f43f5e;
-        color: white;
-        border-radius: 0.75rem;
-        border: none;
-        padding: 0.5rem 1.5rem;
-        font-weight: bold;
-        width: 100%;
-        transition: all 0.3s;
-    }
-    .stButton > button:hover {
-        background-color: #e11d48;
-        box-shadow: 0 10px 15px -3px rgba(244, 63, 94, 0.3);
-    }
-
-    /* 結果卡片 */
-    .result-card {
-        background: rgba(255,255,255,0.05);
-        backdrop-filter: blur(10px);
-        border: 1px solid rgba(255,255,255,0.1);
-        border-radius: 1rem;
-        padding: 1rem;
-        margin-bottom: 1rem;
-    }
-
-    /* 隱藏預設選單 */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
+    .stApp { background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color: white; font-family: 'Inter', sans-serif; }
+    h1 { font-weight: 900; text-align: center; color: white; }
+    h1 span { color: #3b82f6; } /* 藍色強調 */
+    .stFileUploader { background: rgba(255,255,255,0.05); border: 1px dashed rgba(255,255,255,0.2); border-radius: 1rem; padding: 2rem; }
+    .stButton > button { background-color: #3b82f6; color: white; border: none; border-radius: 0.5rem; font-weight: bold; transition: 0.3s; }
+    .stButton > button:hover { background-color: #2563eb; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4); }
 </style>
 """, unsafe_allow_html=True)
 
 
-# --- 功能函式 ---
-
-def get_api_key():
-    """從 Streamlit Secrets 安全獲取 API Key"""
-    try:
-        return st.secrets["GOOGLE_API_KEY"]
-    except Exception:
-        return None
-
-
-def process_image_with_gemini(api_key, image_bytes, mime_type):
+# --- 核心處理函式 (OpenCV) ---
+def remove_watermark_opencv(image_bytes, threshold=200):
     """
-    呼叫 Gemini API 進行圖像修復
-    使用 requests 直接呼叫 REST API 以確保 responseModalities 參數生效
+    使用 OpenCV 進行浮水印偵測與修復
+    :param threshold: 亮度閾值，越高只選越白的地方
     """
-    # 修正重點：使用目前支援 Image Output 的模型
-    model_name = "gemini-2.0-flash-exp"
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+    # 1. 轉換圖片格式 (Bytes -> CV2)
+    file_bytes = np.asarray(bytearray(image_bytes), dtype=np.uint8)
+    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-    base64_data = base64.b64encode(image_bytes).decode('utf-8')
+    # 2. 製作遮罩 (Mask) - 假設浮水印通常是白色或高亮的
+    # 轉灰階
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    payload = {
-        "contents": [{
-            "parts": [
-                {
-                    "text": "Inpaint all text overlays and visual artifacts to restore the underlying background. Return a clean, high-quality image."},
-                {"inlineData": {"mimeType": mime_type, "data": base64_data}}
-            ]
-        }],
-        "safetySettings": [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-        ],
-        "generationConfig": {
-            "responseModalities": ["IMAGE"]  # 關鍵：要求回傳圖片
-        }
-    }
+    # 二值化：找出高亮區域 (浮水印通常很亮)
+    _, mask = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
 
-    headers = {'Content-Type': 'application/json'}
+    # 3. 膨脹遮罩 (Dilate) - 讓遮罩稍微大一點，蓋住邊緣
+    kernel = np.ones((3, 3), np.uint8)
+    dilated_mask = cv2.dilate(mask, kernel, iterations=1)
 
-    try:
-        response = requests.post(url, headers=headers, data=json.dumps(payload))
+    # 4. 修復 (Inpainting) - 使用 Telea 算法修補遮罩區域
+    # radius=3 參考周圍 3px 的顏色來修補
+    result = cv2.inpaint(img, dilated_mask, 3, cv2.INPAINT_TELEA)
 
-        if response.status_code == 429:
-            return {"error": "API 請求過於頻繁 (Rate Limit)，請稍後再試。"}
+    # 5. 轉回 Bytes (CV2 BGR -> RGB -> Bytes)
+    result_rgb = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(result_rgb)
 
-        if response.status_code != 200:
-            # 嘗試解析錯誤訊息
-            try:
-                err_json = response.json()
-                err_msg = err_json.get('error', {}).get('message', response.text)
-                return {"error": f"API 錯誤 ({response.status_code}): {err_msg}"}
-            except:
-                return {"error": f"API 錯誤 ({response.status_code})"}
-
-        result = response.json()
-
-        try:
-            # 嘗試讀取回傳的圖片
-            inline_data = result['candidates'][0]['content']['parts'][0]['inlineData']['data']
-            return inline_data  # 回傳 Base64 字串
-        except (KeyError, IndexError, TypeError):
-            if 'promptFeedback' in result and 'blockReason' in result['promptFeedback']:
-                return {"error": f"內容被阻擋: {result['promptFeedback']['blockReason']}"}
-            if 'candidates' in result and result['candidates'] and 'finishReason' in result['candidates'][0]:
-                return {"error": f"生成停止: {result['candidates'][0]['finishReason']}"}
-
-            return {"error": "API 未返回圖片，請確認模型狀態。"}
-
-    except requests.exceptions.RequestException as e:
-        return {"error": f"網路連線錯誤: {str(e)}"}
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    return buf.getvalue(), pil_img
 
 
-# --- 主程式邏輯 ---
-
+# --- 主程式 ---
 def main():
-    st.markdown("<h1>AI 圖片去浮水印 <span>PRO</span></h1>", unsafe_allow_html=True)
+    st.markdown("<h1>圖片去浮水印 <span>CV版</span></h1>", unsafe_allow_html=True)
     st.markdown(
-        "<p style='text-align: center; color: #94a3b8; margin-bottom: 2rem;'>Powered by Gemini 2.0 Flash • 自動移除浮水印</p>",
+        "<p style='text-align: center; color: #94a3b8; margin-bottom: 2rem;'>使用 OpenCV 智慧修復 • 無需 API Key • 永久免費</p>",
         unsafe_allow_html=True)
 
-    # 1. 檢查 API Key
-    api_key = get_api_key()
-    if not api_key:
-        st.warning("⚠️ 尚未設定 API Key")
-        st.info("請前往 Streamlit Cloud 的 **Settings -> Secrets** 設定 `GOOGLE_API_KEY`。")
-        st.stop()
+    # 上傳區
+    uploaded_files = st.file_uploader("上傳圖片 (支援 JPG, PNG, WEBP)", type=['png', 'jpg', 'jpeg', 'webp'],
+                                      accept_multiple_files=True)
 
-    # 2. Session State 初始化
-    if 'processed_images' not in st.session_state:
-        st.session_state.processed_images = {}
+    # 設定區 (側邊或上方)
+    with st.expander("⚙️ 進階設定 (調整修復強度)", expanded=True):
+        st.info("💡 提示：如果浮水印沒清乾淨，請**調低**數值；如果背景被誤刪，請**調高**數值。")
+        threshold = st.slider("浮水印亮度偵測閾值 (Threshold)", min_value=150, max_value=250, value=215, step=1)
 
-        # 3. 上傳區
-    uploaded_files = st.file_uploader("拖放圖片到這裡", type=['png', 'jpg', 'jpeg', 'webp'], accept_multiple_files=True)
-
-    # 4. 處理邏輯
     if uploaded_files:
-        # 判斷是否有新檔案
-        new_files = [f for f in uploaded_files if f.name not in st.session_state.processed_images]
+        if 'processed_images' not in st.session_state:
+            st.session_state.processed_images = {}
 
-        btn_text = "開始處理"
-        if new_files:
-            btn_text = f"開始處理 ({len(new_files)} 張新圖片)"
-
-        if st.button(btn_text, type="primary"):
+        if st.button(f"開始處理 ({len(uploaded_files)} 張)", type="primary"):
             progress_bar = st.progress(0)
-            status_text = st.empty()
-            total = len(uploaded_files)
 
             for i, file in enumerate(uploaded_files):
-                # 如果已經成功處理過，跳過
-                if file.name in st.session_state.processed_images and st.session_state.processed_images[file.name][
-                    'status'] == 'success':
-                    progress_bar.progress((i + 1) / total)
-                    continue
+                img_bytes = file.getvalue()
 
-                status_text.text(f"正在 AI 運算中: {file.name} ...")
+                # 執行 OpenCV 處理
+                processed_bytes, _ = remove_watermark_opencv(img_bytes, threshold)
 
-                # 讀取檔案
-                file_bytes = file.getvalue()
+                # 存入 Session State
+                st.session_state.processed_images[file.name] = {
+                    'original': img_bytes,
+                    'processed': processed_bytes
+                }
+                progress_bar.progress((i + 1) / len(uploaded_files))
 
-                # 呼叫 API
-                result = process_image_with_gemini(api_key, file_bytes, file.type)
+            st.success("處理完成！")
 
-                if isinstance(result, str):  # 成功 (回傳 Base64)
-                    processed_bytes = base64.b64decode(result)
-                    st.session_state.processed_images[file.name] = {
-                        'original': file_bytes,
-                        'processed': processed_bytes,
-                        'status': 'success'
-                    }
-                else:  # 失敗 (回傳 Error Dict)
-                    st.session_state.processed_images[file.name] = {
-                        'original': file_bytes,
-                        'processed': None,
-                        'status': 'error',
-                        'error_msg': result.get('error', 'Unknown Error')
-                    }
-
-                progress_bar.progress((i + 1) / total)
-
-            status_text.text("處理完成！")
-            st.success("任務結束")
-
-    # 5. 結果顯示與下載
-    if st.session_state.processed_images and uploaded_files:
+    # 結果顯示
+    if 'processed_images' in st.session_state and st.session_state.processed_images:
         st.markdown("---")
 
-        # 準備 ZIP 下載
+        # 下載全部
         zip_buffer = io.BytesIO()
-        valid_count = 0
         with zipfile.ZipFile(zip_buffer, "w") as zf:
             for name, data in st.session_state.processed_images.items():
-                if data['status'] == 'success':
-                    clean_name = os.path.splitext(name)[0] + "_cleaned.png"
-                    zf.writestr(clean_name, data['processed'])
-                    valid_count += 1
+                clean_name = os.path.splitext(name)[0] + "_clean.png"
+                zf.writestr(clean_name, data['processed'])
 
-        if valid_count > 0:
-            st.download_button(
-                label="📦 下載全部結果 (ZIP)",
-                data=zip_buffer.getvalue(),
-                file_name="watermark_removed.zip",
-                mime="application/zip",
-                use_container_width=True
-            )
+        st.download_button("📦 下載全部結果 (ZIP)", zip_buffer.getvalue(), "images_clean.zip", "application/zip",
+                           use_container_width=True)
 
-        # 顯示個別卡片
-        current_names = [f.name for f in uploaded_files]
-        for name in current_names:
-            if name in st.session_state.processed_images:
-                data = st.session_state.processed_images[name]
+        # 個別顯示
+        for name, data in st.session_state.processed_images.items():
+            with st.container():
+                st.markdown(
+                    "<div class='result-card' style='background:rgba(255,255,255,0.05); padding:15px; border-radius:10px; margin-bottom:10px;'>",
+                    unsafe_allow_html=True)
+                c1, c2, c3 = st.columns([1, 1, 1])
 
-                with st.container():
-                    st.markdown("<div class='result-card'>", unsafe_allow_html=True)
-                    cols = st.columns([1, 1, 1])
+                with c1:
+                    st.image(data['original'], caption="原始圖片", use_container_width=True)
+                with c2:
+                    st.image(data['processed'], caption="修復結果", use_container_width=True)
+                with c3:
+                    st.write(f"**{name}**")
+                    clean_name = os.path.splitext(name)[0] + "_clean.png"
+                    st.download_button("⬇️ 下載", data['processed'], file_name=clean_name, mime="image/png",
+                                       key=f"btn_{name}")
 
-                    with cols[0]:
-                        st.caption("原始圖片")
-                        st.image(data['original'], use_container_width=True)
-
-                    with cols[1]:
-                        if data['status'] == 'success':
-                            st.caption("去浮水印結果")
-                            st.image(data['processed'], use_container_width=True)
-                        else:
-                            st.error(f"❌ 失敗: {data.get('error_msg')}")
-
-                    with cols[2]:
-                        st.write(f"**{name}**")
-                        if data['status'] == 'success':
-                            clean_name = os.path.splitext(name)[0] + "_cleaned.png"
-                            st.download_button(
-                                label="⬇️ 下載圖片",
-                                data=data['processed'],
-                                file_name=clean_name,
-                                mime="image/png",
-                                key=f"btn_{name}"
-                            )
-                    st.markdown("</div>", unsafe_allow_html=True)
-
-        if st.button("清除結果並重新開始"):
-            st.session_state.processed_images = {}
-            st.rerun()
+                st.markdown("</div>", unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
